@@ -1,0 +1,49 @@
+-- 1. 题库表
+CREATE TABLE questions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    question_text TEXT NOT NULL,
+    question_type ENUM('single_choice', 'multi_choice', 'true_false', 'short_answer', 'essay') NOT NULL,
+    options JSON,  -- 选择题选项
+    answer TEXT,  -- 正确答案/解析
+    difficulty ENUM('easy', 'medium', 'hard') DEFAULT 'medium',
+    subject VARCHAR(100),
+    chapter VARCHAR(100),
+    knowledge_points JSON,
+    created_by INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. 用户表
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('admin', 'teacher', 'student') DEFAULT 'student',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. 用户答题记录
+CREATE TABLE answer_records (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    question_id INT NOT NULL,
+    user_answer TEXT,
+    is_correct BOOLEAN,
+    time_spent INT,  -- 答题耗时(秒)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (question_id) REFERENCES questions(id)
+);
+
+-- 4. 错题本
+CREATE TABLE wrong_questions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    question_id INT NOT NULL,
+    wrong_times INT DEFAULT 1,
+    last_wrong_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (question_id) REFERENCES questions(id),
+    UNIQUE KEY unique_user_question (user_id, question_id)
+);

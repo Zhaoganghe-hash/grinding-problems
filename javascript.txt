@@ -1,0 +1,252 @@
+// server.js
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const app = express();
+app.use(express.json());
+
+// 数据库连接池
+const pool = mysql.createPool({
+    host: 'localhost',
+    user: 'root',
+    password: 'your_password',
+    database: 'question_bank',
+    waitForConnections: true,
+    connectionLimit: 10
+});
+
+// 文件上传配置
+const storage = multer.diskStorage({
+    destination: './uploads/',
+    filename: (req, file, cb) => {
+        cb(null, `${Date.now()}-${file.originalname}`);
+    }
+});
+const upload = multer({ storage });
+
+// 中间件：验证JWT
+const authenticate = async (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: '需要认证' });
+    
+    try {
+        const decoded = jwt.verify(token, 'your_jwt_secret');
+        req.user = decoded;
+        next();
+    } catch (err) {
+        res.status(401).json({ error: '无效的token' });
+    }
+};
+
+// 1. 用户注册
+app.post('/api/register', async (req, res) => {
+    const { username, email, password, role = 'student' } = req.body;
+    
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const [result] = await pool.execute(
+            'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
+            [username, email, hashedPassword, role]
+        );
+        res.status(201).json({ message: '注册成功', userId: result.insertId });
+    } catch (err) {
+        res.status(400).json({ error: '注册失败: ' + err.message });
+    }
+});
+
+// 2. 用户登录
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+    
+    try {
+        const [users] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+        if (users.length === 0) return res.status(401).json({ error: '用户不存在' });
+        
+        const user = users[0];
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) return res.status(401).json({ error: '密码错误' });
+        
+        const token = jwt.sign(
+            { id: user.id, email: user.email, role: user.role },
+            'your_jwt_secret',
+            { expiresIn: '7d' }
+        );
+        
+        res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+    } catch (err) {
+        res.status(500).json({ error: '登录失败' });
+    }
+});
+
+// 3. 上传试题（支持文件上传）
+app.post('/api/questions/upload', authenticate, upload.single('file'), async (req, res) => {
+    if (req.user.role !== 'admin' && req.user.role !== 'teacher') {
+        return res.status(403).json({ error: '无权限上传试题' });
+    }
+    
+    const { file } = req;
+    if (!file) return res.status(400).json({ error: '请选择文件' });
+    
+    // TODO: 实现文件解析逻辑（解析Word/Excel/TXT等）
+    // 这里简化为直接读取文本文件
+    const fs = require('fs').promises;
+    try {
+        const content = await fs.readFile(file.path, 'utf-8');
+        const questions = parseQuestionsFromText(content); // 自定义解析函数
+        
+        // 批量插入数据库
+        for (const q of questions) {
+            await pool.execute(
+                'INSERT INTO questions (question_text, question_type, options, answer, difficulty, subject, chapter, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [q.text, q.type, JSON.stringify(q.options), q.answer, q.difficulty, q.subject, q.chapter, req.user.id]
+            );
+        }
+        
+        res.json({ message: `成功导入${questions.length}道试题` });
+    } catch (err) {
+        res.status(500).json({ error: '文件处理失败: ' + err.message });
+    }
+});
+
+// 4. 获取随机试题（用于刷题）
+app.get('/api/questions/random', authenticate, async (req, res) => {
+    const { count = 10, subject, difficulty, chapter } = req.query;
+    
+    let query = 'SELECT * FROM questions WHERE 1=1';
+    const params = [];
+    
+    if (subject) {
+        query += ' AND subject = ?';
+        params.push(subject);
+    }
+    if (difficulty) {
+        query += ' AND difficulty = ?';
+        params.push(difficulty);
+    }
+    if (chapter) {
+        query += ' AND chapter = ?';
+        params.push(chapter);
+    }
+    
+    query += ' ORDER BY RAND() LIMIT ?';
+    params.push(parseInt(count));
+    
+    try {
+        const [questions] = await pool.execute(query, params);
+        
+        // 不返回答案
+        const questionsWithoutAnswer = questions.map(q => ({
+            id: q.id,
+            question_text: q.question_text,
+            question_type: q.question_type,
+            options: JSON.parse(q.options || '[]'),
+            difficulty: q.difficulty,
+            subject: q.subject,
+            chapter: q.chapter
+        }));
+        
+        res.json(questionsWithoutAnswer);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 5. 提交答案
+app.post('/api/questions/submit', authenticate, async (req, res) => {
+    const { question_id, user_answer, time_spent } = req.body;
+    
+    try {
+        // 获取正确答案
+        const [questions] = await pool.execute(
+            'SELECT answer FROM questions WHERE id = ?',
+            [question_id]
+        );
+        
+        if (questions.length === 0) {
+            return res.status(404).json({ error: '试题不存在' });
+        }
+        
+        const correctAnswer = questions[0].answer;
+        const isCorrect = user_answer === correctAnswer;
+        
+        // 记录答题
+        const [result] = await pool.execute(
+            'INSERT INTO answer_records (user_id, question_id, user_answer, is_correct, time_spent) VALUES (?, ?, ?, ?, ?)',
+            [req.user.id, question_id, user_answer, isCorrect, time_spent]
+        );
+        
+        // 如果是错题，加入错题本
+        if (!isCorrect) {
+            await pool.execute(
+                'INSERT INTO wrong_questions (user_id, question_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE wrong_times = wrong_times + 1, last_wrong_time = CURRENT_TIMESTAMP',
+                [req.user.id, question_id]
+            );
+        }
+        
+        res.json({ 
+            correct: isCorrect, 
+            correct_answer: correctAnswer,
+            record_id: result.insertId 
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 6. 获取错题本
+app.get('/api/wrong-questions', authenticate, async (req, res) => {
+    try {
+        const [wrongQuestions] = await pool.execute(`
+            SELECT q.*, w.wrong_times, w.last_wrong_time 
+            FROM wrong_questions w
+            JOIN questions q ON w.question_id = q.id
+            WHERE w.user_id = ?
+            ORDER BY w.last_wrong_time DESC
+        `, [req.user.id]);
+        
+        res.json(wrongQuestions);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 文件解析函数（示例）
+function parseQuestionsFromText(text) {
+    const questions = [];
+    const lines = text.split('\n');
+    let currentQuestion = null;
+    
+    for (let line of lines) {
+        line = line.trim();
+        if (!line) continue;
+        
+        if (line.startsWith('Q:')) {
+            if (currentQuestion) questions.push(currentQuestion);
+            currentQuestion = {
+                text: line.substring(2).trim(),
+                type: 'single_choice',
+                options: [],
+                answer: '',
+                difficulty: 'medium',
+                subject: 'default',
+                chapter: 'default'
+            };
+        } else if (line.startsWith('A.')) {
+            currentQuestion.options.push(line.substring(2).trim());
+        } else if (line.startsWith('答案:')) {
+            currentQuestion.answer = line.substring(3).trim();
+        }
+    }
+    
+    if (currentQuestion) questions.push(currentQuestion);
+    return questions;
+}
+
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`服务器运行在 http://localhost:${PORT}`);
+});
